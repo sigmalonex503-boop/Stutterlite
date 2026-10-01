@@ -1,0 +1,73 @@
+# StutterLite build workflow.
+#
+# Only 2 files to upload to your repo (manifest.json is generated automatically):
+#   main.cpp                           (repo root)
+#   libpreloader.so                    (repo root — extracted from LeviLauncher)
+#   .github/workflows/build.yml        (this file)
+#
+# Then: GitHub repo page -> Actions tab -> run this workflow -> download
+# "stutterlite-release" from the run's Artifacts section when it finishes.
+# Everything heavy (the Android NDK download) happens on GitHub's server,
+# not on your phone.
+
+name: Build StutterLite
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Check the 2 required files are present
+        run: |
+          test -f main.cpp || { echo "::error::main.cpp not found at repo root — upload it there"; exit 1; }
+          test -f libpreloader.so || { echo "::error::libpreloader.so not found at repo root — extract it from your LeviLauncher app and upload it there"; exit 1; }
+
+      - name: Install Android NDK r28c
+        run: |
+          curl -sSL -o ndk.zip https://dl.google.com/android/repository/android-ndk-r28c-linux.zip
+          unzip -q ndk.zip
+          echo "NDK=$PWD/android-ndk-r28c" >> "$GITHUB_ENV"
+
+      - name: Compile
+        run: |
+          B="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          SYS="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          mkdir -p out wrap
+          ln -s "$B/lld" wrap/ld.lld
+          "$B/clang++" \
+            --target=aarch64-linux-android28 --sysroot="$SYS" -Bwrap \
+            -std=c++20 -O2 -DNDEBUG -fPIC -fvisibility=hidden -fvisibility-inlines-hidden \
+            -shared main.cpp \
+            -L. -lpreloader -llog -ldl -lm \
+            -Wl,-z,max-page-size=16384 -Wl,-z,relro -Wl,-z,now -Wl,--build-id=sha1 \
+            -o out/libstutterlite.so
+          "$B/llvm-objcopy" --strip-unneeded out/libstutterlite.so
+
+      - name: Package
+        run: |
+          mkdir -p release
+          cp out/libstutterlite.so release/
+          cat > release/manifest.json <<'EOF'
+          {
+            "type": "preload-native",
+            "name": "StutterLite",
+            "author": "you",
+            "version": "0.1.0",
+            "entry": "libstutterlite.so",
+            "minecraft_versions": ["1.26.*", "1.26.4*"]
+          }
+          EOF
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: stutterlite-release
+          path: release/
+          
