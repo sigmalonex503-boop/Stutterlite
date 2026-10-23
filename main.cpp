@@ -25,9 +25,13 @@
 #include <android/log.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <functional>
@@ -209,6 +213,78 @@ void remove() {
 // ---------------------------------------------------------------------------
 // Feature 2: thread monitor (counts only, changes nothing).
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Feature 3: report fewer CPU cores to the game (experimental).
+//
+// Why: several real Bedrock/Java performance mods (Volt, StutterFix) get
+// their gains by limiting how many worker threads the game spins up for
+// background work like chunk building — fewer threads fighting over the
+// same CPU cores means less contention on the main thread. The game (and
+// the C++ runtime underneath it) decides how many worker threads to create
+// by asking the OS "how many CPU cores are online?" via the standard
+// sysconf(_SC_NPROCESSORS_ONLN) call. We hook that single, simple,
+// version-independent OS function (same hooking style already proven to
+// work by the GL-hooking mods on this device) and make it return a smaller
+// number than the real core count — nothing else about the device changes,
+// we just answer that one question differently.
+// ---------------------------------------------------------------------------
+namespace feature_cores {
+
+using SysconfFn = long (*)(int);
+
+std::atomic_bool gEnabled{false};
+std::atomic_bool gInstalled{false};
+std::atomic<long> gRealCores{0};
+std::atomic<long> gReportedCores{0};
+SysconfFn gOriginal{nullptr};
+void* gTarget{nullptr};
+
+long detour(int name) {
+    long real = gOriginal(name);
+    if (name == _SC_NPROCESSORS_ONLN && gEnabled.load(std::memory_order_relaxed)) {
+        long cap = gReportedCores.load(std::memory_order_relaxed);
+        if (cap > 0 && cap < real) return cap;
+    }
+    return real;
+}
+
+bool install() {
+    void* sym = dlsym(RTLD_DEFAULT, "sysconf");
+    if (!sym) {
+        SL_LOGE("cpu-cores: sysconf symbol not found — feature unavailable");
+        return false;
+    }
+    gTarget = sym;
+    if (pl::memory::hook(gTarget, reinterpret_cast<void*>(&detour),
+                          reinterpret_cast<void**>(&gOriginal)) != 0) {
+        SL_LOGE("cpu-cores: hook install failed");
+        gTarget = nullptr;
+        return false;
+    }
+    long real = gOriginal(_SC_NPROCESSORS_ONLN);
+    gRealCores.store(real, std::memory_order_relaxed);
+    // Default target: leave at least half the cores visible, minimum 2 —
+    // matches StutterFix's "fewer worker threads" idea without starving the
+    // game entirely. The menu lets you change this number directly.
+    long target = real > 3 ? (real / 2) : real;
+    if (target < 2) target = real;  // don't go below 2 on small devices
+    gReportedCores.store(target, std::memory_order_relaxed);
+    gInstalled.store(true, std::memory_order_release);
+    SL_LOGI("cpu-cores: ready (real=%ld, default_reported=%ld)", real, target);
+    return true;
+}
+
+void remove() {
+    if (gTarget && gOriginal) {
+        pl::memory::unhook(gTarget, reinterpret_cast<void*>(&detour));
+    }
+    gTarget = nullptr;
+    gOriginal = nullptr;
+    gInstalled.store(false, std::memory_order_release);
+}
+
+}  // namespace feature_cores
+
 namespace feature_threads {
 
 using CreateFn = int (*)(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
@@ -292,6 +368,16 @@ std::string statusLine() {
     s += feature_skip::gAvailable.load(std::memory_order_relaxed) ? "ready" : "NOT available on this game build";
     s += " | thread_monitor: ";
     s += feature_threads::gInstalled.load(std::memory_order_relaxed) ? "running" : "NOT available";
+    s += " | cpu_cores: ";
+    if (feature_cores::gInstalled.load(std::memory_order_relaxed)) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "ready (real=%ld, reporting=%ld)",
+                 feature_cores::gRealCores.load(std::memory_order_relaxed),
+                 feature_cores::gReportedCores.load(std::memory_order_relaxed));
+        s += buf;
+    } else {
+        s += "NOT available";
+    }
     return s;
 }
 
@@ -319,6 +405,16 @@ bool registerMenu() {
              ? "Thread monitor (log only, no changes)"
              : "Thread monitor — unavailable on this device",
          pl::modmenu::ConfigType::Toggle, "true", "", "", ""},
+        {"limit_cpu_cores",
+         feature_cores::gInstalled.load(std::memory_order_relaxed)
+             ? "Report fewer CPU cores to the game (experimental)"
+             : "Report fewer CPU cores — unavailable on this device",
+         pl::modmenu::ConfigType::Toggle, "false", "", "", ""},
+        {"reported_cores", "Cores to report (only while the toggle above is on)",
+         pl::modmenu::ConfigType::SliderInt,
+         std::to_string(feature_cores::gReportedCores.load(std::memory_order_relaxed)),
+         "2", std::to_string(std::max<long>(2, feature_cores::gRealCores.load(std::memory_order_relaxed))),
+         "limit_cpu_cores"},
     };
     m.onToggle = [](std::string_view, bool) {};
     m.onConfigChanged = [](std::string_view, std::string_view key, std::string_view value) {
@@ -329,6 +425,15 @@ bool registerMenu() {
         } else if (key == "thread_monitor") {
             feature_threads::gEnabled.store(on, std::memory_order_relaxed);
             SL_LOGI("thread-monitor: %s", on ? "ON" : "OFF");
+        } else if (key == "limit_cpu_cores") {
+            feature_cores::gEnabled.store(on, std::memory_order_relaxed);
+            SL_LOGI("cpu-cores: %s", on ? "ON" : "OFF");
+        } else if (key == "reported_cores") {
+            long v = strtol(std::string(value).c_str(), nullptr, 10);
+            if (v >= 1) {
+                feature_cores::gReportedCores.store(v, std::memory_order_relaxed);
+                SL_LOGI("cpu-cores: reported_cores set to %ld", v);
+            }
         }
     };
     return pl::modmenu::registerModule(m);
@@ -354,10 +459,11 @@ public:
         // Each feature is independent: one failing does not stop the others.
         skipReady_ = feature_skip::install();
         threadsReady_ = feature_threads::install();
+        coresReady_ = feature_cores::install();
         menuReady_ = menu::registerMenu();
         if (!menuReady_) SL_LOGE("mod menu registration failed; features keep their defaults");
-        SL_LOGI("enabled (skip_decorative_available=%d, thread_monitor_available=%d)",
-                skipReady_, threadsReady_);
+        SL_LOGI("enabled (skip_decorative_available=%d, thread_monitor_available=%d, cpu_cores_available=%d)",
+                skipReady_, threadsReady_, coresReady_);
         return true;  // stay loaded even if one feature is unavailable
     }
 
@@ -374,60 +480,4 @@ public:
             feature_threads::remove();
             threadsReady_ = false;
         }
-        SL_LOGI("disabled");
-        return true;
-    }
-
-    bool unload() {
-        disable();
-        SL_LOGI("unloaded");
-        return true;
-    }
-
-private:
-    bool skipReady_{false};
-    bool threadsReady_{false};
-    bool menuReady_{false};
-};
-
-StutterLiteMod gMod;
-
-bool loadThunk(void*, void*) {
-    try {
-        return gMod.load();
-    } catch (...) {
-        SL_LOGE("load() threw");
-        return false;
-    }
-}
-bool enableThunk(void*, void*) {
-    try {
-        return gMod.enable();
-    } catch (...) {
-        SL_LOGE("enable() threw");
-        return false;
-    }
-}
-bool disableThunk(void*, void*) {
-    try {
-        return gMod.disable();
-    } catch (...) {
-        SL_LOGE("disable() threw");
-        return false;
-    }
-}
-bool unloadThunk(void*, void*) {
-    try {
-        return gMod.unload();
-    } catch (...) {
-        SL_LOGE("unload() threw");
-        return false;
-    }
-}
-
-}  // namespace
-
-extern "C" __attribute__((visibility("default"))) ModRegistration* PLGetModRegistration() {
-    static ModRegistration r{&gMod, &loadThunk, &enableThunk, &disableThunk, &unloadThunk};
-    return &r;
-}
+        if (cor
