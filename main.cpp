@@ -480,4 +480,65 @@ public:
             feature_threads::remove();
             threadsReady_ = false;
         }
-        if (cor
+        if (coresReady_) {
+            feature_cores::remove();
+            coresReady_ = false;
+        }
+        SL_LOGI("disabled");
+        return true;
+    }
+
+    bool unload() {
+        disable();
+        SL_LOGI("unloaded");
+        return true;
+    }
+
+private:
+    bool skipReady_{false};
+    bool threadsReady_{false};
+    bool coresReady_{false};
+    bool menuReady_{false};
+};
+
+StutterLiteMod gMod;
+
+bool loadThunk(void*, void*) {
+    try {
+        return gMod.load();
+    } catch (...) {
+        SL_LOGE("load() threw");
+        return false;
+    }
+}
+bool enableThunk(void*, void*) {
+    try {
+        return gMod.enable();
+    } catch (...) {
+        SL_LOGE("enable() threw");
+        return false;
+    }
+}
+bool disableThunk(void*, void*) {
+    try {
+        return gMod.disable();
+    } catch (...) {
+        SL_LOGE("disable() threw");
+        return false;
+    }
+}
+bool unloadThunk(void*, void*) {
+    try {
+        return gMod.unload();
+    } catch (...) {
+        SL_LOGE("unload() threw");
+        return false;
+    }
+}
+
+}  // namespace
+
+extern "C" __attribute__((visibility("default"))) ModRegistration* PLGetModRegistration() {
+    static ModRegistration r{&gMod, &loadThunk, &enableThunk, &disableThunk, &unloadThunk};
+    return &r;
+}
